@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+import click
+
+
+from datetime import datetime, timedelta
+import subprocess
+import io
+import logging
+from itertools import chain
+
+
+DEFAULT_PREFIX = "zfs-auto-snap"
+DEFAULT_FMT = "%Y-%m-%d-%Hh%MU"
+DEFAULT_IDENTITY_FILE = "/root/.ssh/github_static"
+
+
+def parse_snapshot_name(name: str) -> dict:
+    root, tag = name.split("@")
+    class_, remainder = tag.split("_")
+    remainder = remainder.split("-")
+    frequency = remainder[0]
+    remainder = "-".join(remainder[1:])
+    snapshot_time = datetime.strptime(remainder, DEFAULT_FMT)
+    return dict(
+        dataset=root,
+        class_=class_,
+        frequency=frequency,
+        snapshot_time=snapshot_time
+    )
+
+
+def parse_all_snapshot_names(names: str) -> dict:
+    names = names.splitlines()[1:]
+    snapshots = [parse_snapshot_name(name) for name in names]
+
+    sorted_ = {}
+    for snap in snapshots:
+        dataset = snap["dataset"]
+        if dataset not in sorted_:
+            sorted_[dataset] = {}
+
+        class_ = snap["class_"]
+        if class_ not in sorted_[dataset]:
+            sorted_[dataset][class_] = {}
+
+        frequency = snap["frequency"]
+        if frequency not in sorted_[dataset][class_]:
+            sorted_[dataset][class_][frequency] = []
+
+        sorted_[dataset][class_][frequency].append(
+            snap["snapshot_time"]
+        )
+
+    for dataset_name, dataset in list(sorted_.items()):
+        for class_name, class_ in list(dataset.items()):
+            for frequency_name, frequency in list(class_.items()):
+                sorted_[dataset_name][class_name][frequency_name] = sorted(frequency)
+
+    return sorted_
+
+
+def strf(source, class_, frequency, dt):
+    dtf = dt.strftime(DEFAULT_FMT)
+    return f"{source}@{class_}_{frequency}-{dtf}"
+
+
+def chain_snapshots(snaps):
+    return chain(*[
+        [
+            (freq, dt)
+            for dt in freq_data
+        ]
+        for freq, freq_data in snaps.items()
+    ])
+
+
+def first_snapshot(snaps, after_or=None, strict=False):
+    def after_(snap):
+        if after_or:
+            if strict:
+                return snap[1] > after_or
+            else:
+                return snap[1] >= after_or
+        else:
+            return True
+    return min(
+        (snap for snap in chain_snapshots(snaps) if after_(snap)),
+        key=lambda x: x[1]
+    )
+
+
+def last_snapshot(snaps, before_or=None, strict=False):
+    def before_(snap):
+        if before_or:
+            if strict:
+                return snap[1] < before_or
+            else:
+                return snap[1] <= before_or
+        else:
+            return True
+    return max(
+        (snap for snap in chain_snapshots(snaps) if before_(snap)),
+        key=lambda x: x[1]
+    )
+
+
+def buffered_pipe(send, recv):
+    done = False
+
+    while not done:
+        read = send.stdout.read(4194000)
+        logging.debug(f"-> {len(read)}")
+        if read and len(read) != 0:
+            if recv.poll():
+                raise RuntimeError(f"receiving end exited with {recv.returncode}")
+            write = recv.stdin.write(read)
+            if not write:
+                raise RuntimeError("could not write to recv stream")
+            logging.debug(f"<- {len(read)}")
+        else:
+            done = True
+
+    logging.debug("send/receive done")
+
+    send.wait(timeout=60)
+    recv.wait(timeout=60)
+
+    if send.returncode != 0 or recv.returncode != 0:
+        raise RuntimeError(f"zfs send/receive failed with send={send.returncode} and recv={recv.returncode}")
+
+
+class Zfs:
+    def __init__(self, dataset, prefix, host="localhost", identity_file=None):
+        self.host = host
+        self.identity_file = identity_file
+        self.remote = host != "localhost"
+
+        self.prefix = prefix
+        self.dataset = dataset
+
+    def _zfs_invoke(self, *args):
+        invoke = []
+
+        if self.remote:
+            invoke.append("ssh")
+            if self.identity_file:
+                invoke += ["-i", self.identity_file]
+            invoke.append(self.host)
+
+        invoke.append("zfs")
+
+        invoke += args
+
+        return invoke
+
+    def run_zfs(self, *args):
+        invoke = self._zfs_invoke(*args)
+
+        res = subprocess.run(invoke, capture_output=True, text=True)
+
+        if res.stderr:
+            logging.warning(f"zfs: {res.stderr}")
+
+        if res.returncode != 0:
+            logging.error(f"zfs: failed with exit code {res.returncode}")
+            raise RuntimeError(f"a call to zfs failed: (EXIT={res.returncode}) {res.stderr}")
+
+        return res.stdout
+
+    def list_snapshots(self):
+        res = self.run_zfs("list", "-t", "snapshot", "-o", "name")
+        snaps = parse_all_snapshot_names(res)
+        if self.dataset in snaps:
+            if self.prefix in snaps[self.dataset]:
+                return snaps[self.dataset][self.prefix]
+        return {}
+
+    def send(self, freq, dt):
+        from_ = strf(self.dataset, self.prefix, freq, dt)
+        invoke = self._zfs_invoke("send", "-w", from_)
+        return subprocess.Popen(
+            invoke,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+    def receive(self):
+        invoke = self._zfs_invoke("receive", self.dataset)
+        return subprocess.Popen(
+            invoke,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+    def send_between(self, freq_from, dt_from, freq_to, dt_to):
+        from_ = strf(self.dataset, self.prefix, freq_from, dt_from)
+        from_ = "@" + from_.split("@")[1]
+        to_ = strf(self.dataset, self.prefix, freq_to, dt_to)
+        invoke = self._zfs_invoke("send", "-w", "-I", from_, to_)
+        return subprocess.Popen(
+            invoke,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+    def destroy_all_to(self, freq, dt):
+        to = strf(self.dataset, self.prefix, freq, dt)
+        to = f"{self.dataset}@%" + to.split("@")[1]
+        return self.run_zfs("destroy", to)
+
+
+@click.group(
+    name="zsnap"
+)
+@click.option(
+    "--prefix",
+    default=DEFAULT_PREFIX,
+    show_default=True
+)
+@click.option(
+    "--identity-file",
+    default=DEFAULT_IDENTITY_FILE,
+    type=click.Path(),
+    show_default=True
+)
+@click.pass_context
+def zsnap(ctx, prefix, identity_file):
+    ctx.obj["prefix"] = prefix
+    ctx.obj["identity_file"] = identity_file
+
+
+@zsnap.command(
+    name="sync"
+)
+@click.argument(
+    "source"
+)
+@click.argument(
+    "destination"
+)
+@click.option(
+    "--source-uri",
+    type=str,
+    default="localhost",
+    show_default=True
+)
+@click.option(
+    "--destination-uri",
+    type=str,
+    default="root@35.240.48.84",
+    show_default=True
+)
+@click.option(
+    "--prune",
+    type=bool,
+    is_flag=True
+)
+@click.pass_context
+def zsnap_sync(ctx, source_uri, destination_uri, source, destination, prune):
+    prefix = ctx.obj["prefix"]
+    identity_file = ctx.obj["identity_file"]
+    logging.debug(f"sync with prefix `{prefix}'")
+
+    local_zfs = Zfs(source, prefix, source_uri, identity_file)
+    source_snapshots = local_zfs.list_snapshots()
+    logging.debug(f"found {len(source_snapshots)} tracks in source")
+
+    if not source_snapshots:
+        logging.warning("no snapshot in source, exiting")
+        exit(0)
+
+    remote_zfs = Zfs(destination, prefix, destination_uri, identity_file)
+    remote_snapshots = remote_zfs.list_snapshots()
+    logging.debug(f"found {len(remote_snapshots)} tracks in destination")
+
+    if not remote_snapshots:
+        logging.warning("remote is empty, syncing initial")
+        freq, min_dt = min(
+            chain_snapshots(source_snapshots),
+            key=lambda x: x[1]
+        )
+
+        fted = strf(source, prefix, freq, min_dt)
+        logging.debug(f"{fted} is initial")
+
+        logging.debug("spawning `zfs send -w'")
+        send = local_zfs.send(freq, min_dt)
+
+        logging.debug("spawning `zfs receive'")
+        recv = remote_zfs.receive()
+
+        logging.debug("transfer starts now")
+        buffered_pipe(send, recv)
+        remote_snapshots = remote_zfs.list_snapshots()
+
+    remote_last = last_snapshot(remote_snapshots)
+    logging.debug(f"remote's last is on {remote_last[1]}")
+
+    source_first = first_snapshot(source_snapshots, after_or=remote_last[1])
+    logging.debug(f"sources's first after that is on {source_first[1]}")
+
+    if remote_last != source_first:
+        raise RuntimeError("source and remote are out of sync")
+
+    source_last = last_snapshot(source_snapshots)
+    logging.debug(f"source's last is on {source_last[1]}")
+
+    if source_first == source_last:
+        logging.debug("nothing to do")
+    else:
+        logging.debug("spawning `zfs send -w'")
+        send = local_zfs.send_between(*chain(remote_last, source_last))
+
+        logging.debug("spawning `zfs receive'")
+        recv = remote_zfs.receive()
+
+        logging.debug("transfer starts now")
+        buffered_pipe(send, recv)
+
+    if prune:
+        cutoff = source_last[1] - timedelta(days=1)
+        if first_snapshot(source_snapshots)[1] < cutoff:
+            source_prune_head = last_snapshot(
+                source_snapshots,
+                before_or=cutoff,
+                strict=True
+            )
+            logging.debug(f"pruning all to {source_prune_head[1]}")
+            local_zfs.destroy_all_to(*source_prune_head)
+        else:
+            logging.debug("nothing to prune")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    zsnap(obj={})
